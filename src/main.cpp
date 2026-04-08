@@ -27,6 +27,13 @@ static float g_thermalScore = 0.0f;
 static float g_finalScore = 0.0f;
 static bool g_suspicious = false;
 
+// 현재는 GPS 모듈이 없으므로 더미값 사용
+static float g_latitude = 37.566500f;
+static float g_longitude = 126.978000f;
+
+// 앱 표시용 BLE 상태 문자열
+static const char* g_bleStatusText = "연결됨";
+
 static void userLedOn(bool on) {
     pinMode(PIN_USER_LED, OUTPUT);
     digitalWrite(PIN_USER_LED, on ? HIGH : LOW);
@@ -56,6 +63,16 @@ static void setLEDWarning() {
     digitalWrite(PIN_LED_B, LOW);
 }
 
+static const char* getDetectionStatusText(float score) {
+    if (score >= DANGER_THRESHOLD) {
+        return "위험";
+    } else if (score >= WARNING_THRESHOLD) {
+        return "주의";
+    } else {
+        return "안전";
+    }
+}
+
 static void applyResultLeds(float finalScore) {
     if (finalScore >= DANGER_THRESHOLD) {
         g_suspicious = true;
@@ -69,6 +86,27 @@ static void applyResultLeds(float finalScore) {
         g_suspicious = false;
         setLEDSafe();
         userLedOn(false);
+    }
+}
+
+static void sendCurrentStatus(float score) {
+    const char* detectionStatus = getDetectionStatusText(score);
+
+    sendStatus(
+        g_bleStatusText,
+        detectionStatus,
+        score,
+        g_latitude,
+        g_longitude
+    );
+
+    if (score >= DANGER_THRESHOLD) {
+        sendAlert(
+            detectionStatus,
+            score,
+            g_latitude,
+            g_longitude
+        );
     }
 }
 
@@ -93,6 +131,9 @@ static void enterState(DeviceState next) {
             setLEDIdle();
             userLedOn(false);
             Serial.println("[STATE] IDLE");
+
+            // 대기 상태일 때 앱에도 기본 상태 전송
+            sendCurrentStatus(0.0f);
             break;
 
         case STATE_BLE_WAIT:
@@ -144,6 +185,9 @@ void setup() {
     Serial.println(" Owl Guard - XIAO ESP32-S3 Sense");
     Serial.println("===================================");
 
+    // 앱 초기 화면용 상태 전송
+    sendStatus(g_bleStatusText, "안전", 0.0f, g_latitude, g_longitude);
+
     enterState(STATE_IDLE);
 }
 
@@ -186,11 +230,7 @@ void loop() {
                 g_finalScore = g_imageScore;
 
                 applyResultLeds(g_finalScore);
-
-                if (g_suspicious) {
-                    sendAlert(g_finalScore);
-                }
-                sendBleResult(g_finalScore);
+                sendCurrentStatus(g_finalScore);
 
                 enterState(STATE_RESULT);
             } else {
@@ -211,11 +251,7 @@ void loop() {
             Serial.printf("[FUSE ] finalScore   = %.3f\n", g_finalScore);
 
             applyResultLeds(g_finalScore);
-
-            if (g_suspicious) {
-                sendAlert(g_finalScore);
-            }
-            sendBleResult(g_finalScore);
+            sendCurrentStatus(g_finalScore);
 
             enterState(STATE_RESULT);
             break;
