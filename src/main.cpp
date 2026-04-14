@@ -1,284 +1,235 @@
-#include <Arduino.h>
-#include <Pins.h>
-#include <Config.h>
-#include <LED.h>
-#include <Sensors.h>
-#include <Detection.h>
-#include <Comm.h>
-#include "esp_sleep.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include "esp_camera.h"
 
-enum DeviceState {
-    STATE_BOOT = 0,
-    STATE_IDLE,
-    STATE_BLE_WAIT,
-    STATE_FIRST_SCAN,
-    STATE_SECOND_SCAN,
-    STATE_RESULT,
-    STATE_SLEEP
-};
+// ==========================
+// Wi-Fi 설정
+// ==========================
+const char* WIFI_SSID = "sms";
+const char* WIFI_PASS = "03080308";
 
-static DeviceState currentState = STATE_BOOT;
+// ==========================
+// XIAO ESP32S3 Sense camera pin map
+// ==========================
+#define PWDN_GPIO_NUM  -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  10
+#define SIOD_GPIO_NUM  40
+#define SIOC_GPIO_NUM  39
 
-static unsigned long g_idleEnteredAt = 0;
-static unsigned long g_resultEnteredAt = 0;
+#define Y9_GPIO_NUM    48
+#define Y8_GPIO_NUM    11
+#define Y7_GPIO_NUM    12
+#define Y6_GPIO_NUM    14
+#define Y5_GPIO_NUM    16
+#define Y4_GPIO_NUM    18
+#define Y3_GPIO_NUM    17
+#define Y2_GPIO_NUM    15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM  47
+#define PCLK_GPIO_NUM  13
 
-static float g_imageScore = 0.0f;
-static float g_thermalScore = 0.0f;
-static float g_finalScore = 0.0f;
-static bool g_suspicious = false;
+WebServer server(80);
 
-// 현재는 GPS 모듈이 없으므로 더미값 사용
-static float g_latitude = 37.566500f;
-static float g_longitude = 126.978000f;
+// 최신 촬영 사진을 보관할 버퍼
+uint8_t* latestPhotoBuffer = nullptr;
+size_t latestPhotoLen = 0;
 
-// 앱 표시용 BLE 상태 문자열
-static const char* g_bleStatusText = "연결됨";
+bool initCamera() {
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
 
-static void userLedOn(bool on) {
-    pinMode(PIN_USER_LED, OUTPUT);
-    digitalWrite(PIN_USER_LED, on ? HIGH : LOW);
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count     = 2;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+  } else {
+    config.frame_size   = FRAMESIZE_VGA;
+    config.jpeg_quality = 15;
+    config.fb_count     = 1;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("카메라 초기화 실패: 0x%x\n", err);
+    return false;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+  }
+
+  Serial.println("카메라 초기화 완료");
+  return true;
 }
 
-static void rgbOff() {
-    digitalWrite(PIN_LED_R, LOW);
-    digitalWrite(PIN_LED_G, LOW);
-    digitalWrite(PIN_LED_B, LOW);
+bool capturePhotoToMemory() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("사진 촬영 실패");
+    return false;
+  }
+
+  uint8_t* newBuffer = (uint8_t*)malloc(fb->len);
+  if (!newBuffer) {
+    Serial.println("메모리 할당 실패");
+    esp_camera_fb_return(fb);
+    return false;
+  }
+
+  memcpy(newBuffer, fb->buf, fb->len);
+
+  if (latestPhotoBuffer != nullptr) {
+    free(latestPhotoBuffer);
+    latestPhotoBuffer = nullptr;
+  }
+
+  latestPhotoBuffer = newBuffer;
+  latestPhotoLen = fb->len;
+
+  Serial.printf("사진 촬영 완료: %u bytes\n", (unsigned int)latestPhotoLen);
+
+  esp_camera_fb_return(fb);
+  return true;
 }
 
-static void blinkDanger(int count, int delayMs) {
-    for (int i = 0; i < count; i++) {
-        setLEDDanger();
-        userLedOn(true);
-        delay(delayMs);
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(1000);
 
-        rgbOff();
-        userLedOn(false);
-        delay(delayMs);
-    }
+  Serial.println("Wi-Fi 연결 시작");
+  Serial.print("SSID: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int retry = 0;
+  const int maxRetry = 40;
+
+  while (WiFi.status() != WL_CONNECTED && retry < maxRetry) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi 연결 완료");
+    Serial.print("IP 주소: http://");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("Wi-Fi 연결 실패");
+    Serial.println("1. SSID / 비밀번호 확인");
+    Serial.println("2. 2.4GHz Wi-Fi 확인");
+    Serial.println("3. 공유기 거리 확인");
+    return false;
+  }
 }
 
-static void setLEDWarning() {
-    digitalWrite(PIN_LED_R, HIGH);
-    digitalWrite(PIN_LED_G, HIGH);
-    digitalWrite(PIN_LED_B, LOW);
+void handleRoot() {
+  String html;
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>XIAO Camera</title></head><body>";
+  html += "<h1>XIAO ESP32S3 Camera</h1>";
+  html += "<p><a href='/capture'>사진 촬영</a></p>";
+  html += "<p><a href='/latest.jpg' target='_blank'>최신 사진 보기</a></p>";
+  html += "<p>최신 사진 미리보기:</p>";
+  html += "<img src='/latest.jpg?ts=" + String(millis()) + "' style='max-width:100%;height:auto;border:1px solid #ccc;' />";
+  html += "</body></html>";
+
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
-static const char* getDetectionStatusText(float score) {
-    if (score >= DANGER_THRESHOLD) {
-        return "위험";
-    } else if (score >= WARNING_THRESHOLD) {
-        return "주의";
-    } else {
-        return "안전";
-    }
+void handleCapture() {
+  if (!capturePhotoToMemory()) {
+    server.send(500, "text/plain; charset=utf-8", "사진 촬영 실패");
+    return;
+  }
+
+  String html;
+  html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Capture Done</title></head><body>";
+  html += "<h2>촬영 완료</h2>";
+  html += "<p><a href='/latest.jpg' target='_blank'>최신 사진 열기</a></p>";
+  html += "<p><a href='/'>메인으로</a></p>";
+  html += "<img src='/latest.jpg?ts=" + String(millis()) + "' style='max-width:100%;height:auto;border:1px solid #ccc;' />";
+  html += "</body></html>";
+
+  server.send(200, "text/html; charset=utf-8", html);
 }
 
-static void applyResultLeds(float finalScore) {
-    if (finalScore >= DANGER_THRESHOLD) {
-        g_suspicious = true;
-        setLEDDanger();
-        userLedOn(true);
-    } else if (finalScore >= WARNING_THRESHOLD) {
-        g_suspicious = true;
-        setLEDWarning();
-        userLedOn(true);
-    } else {
-        g_suspicious = false;
-        setLEDSafe();
-        userLedOn(false);
-    }
-}
+void handleLatestJpg() {
+  if (latestPhotoBuffer == nullptr || latestPhotoLen == 0) {
+    server.send(404, "text/plain; charset=utf-8", "아직 촬영된 사진이 없습니다. 먼저 /capture 실행");
+    return;
+  }
 
-static void sendCurrentStatus(float score) {
-    const char* detectionStatus = getDetectionStatusText(score);
-
-    sendStatus(
-        g_bleStatusText,
-        detectionStatus,
-        score,
-        g_latitude,
-        g_longitude
-    );
-
-    if (score >= DANGER_THRESHOLD) {
-        sendAlert(
-            detectionStatus,
-            score,
-            g_latitude,
-            g_longitude
-        );
-    }
-}
-
-static void goDeepSleep() {
-    Serial.println("[POWER] Entering deep sleep...");
-
-    stopIR();
-    rgbOff();
-    userLedOn(false);
-
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_1, 1);
-    delay(100);
-    esp_deep_sleep_start();
-}
-
-static void enterState(DeviceState next) {
-    currentState = next;
-
-    switch (currentState) {
-        case STATE_IDLE:
-            g_idleEnteredAt = millis();
-            setLEDIdle();
-            userLedOn(false);
-            Serial.println("[STATE] IDLE");
-
-            // 대기 상태일 때 앱에도 기본 상태 전송
-            sendCurrentStatus(0.0f);
-            break;
-
-        case STATE_BLE_WAIT:
-            setLEDScanning();
-            Serial.println("[STATE] BLE_WAIT");
-            break;
-
-        case STATE_FIRST_SCAN:
-            setLEDScanning();
-            Serial.println("[STATE] FIRST_SCAN");
-            break;
-
-        case STATE_SECOND_SCAN:
-            setLEDScanning();
-            Serial.println("[STATE] SECOND_SCAN");
-            break;
-
-        case STATE_RESULT:
-            g_resultEnteredAt = millis();
-            Serial.println("[STATE] RESULT");
-            break;
-
-        case STATE_SLEEP:
-            Serial.println("[STATE] SLEEP");
-            break;
-
-        case STATE_BOOT:
-        default:
-            break;
-    }
+  server.send_P(200, "image/jpeg", (const char*)latestPhotoBuffer, latestPhotoLen);
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(1200);
+  Serial.begin(115200);
+  delay(3000);
 
-    pinMode(PIN_BUTTON, INPUT);
-    pinMode(PIN_IR_LED, OUTPUT);
-    pinMode(PIN_USER_LED, OUTPUT);
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println("XIAO ESP32S3 Sense Camera + Web");
+  Serial.println("======================================");
 
-    digitalWrite(PIN_IR_LED, LOW);
+  if (!initCamera()) {
+    Serial.println("카메라 초기화 실패로 중단");
+    while (true) delay(1000);
+  }
 
-    initLED();
-    initSensors();
-    initBLE();
+  if (!connectWiFi()) {
+    Serial.println("Wi-Fi 연결 실패로 웹서버를 시작하지 않음");
+    while (true) delay(1000);
+  }
 
-    Serial.println();
-    Serial.println("===================================");
-    Serial.println(" Owl Guard - XIAO ESP32-S3 Sense");
-    Serial.println("===================================");
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/latest.jpg", HTTP_GET, handleLatestJpg);
 
-    // 앱 초기 화면용 상태 전송
-    sendStatus(g_bleStatusText, "안전", 0.0f, g_latitude, g_longitude);
-
-    enterState(STATE_IDLE);
+  server.begin();
+  Serial.println("웹서버 시작 완료");
+  Serial.println("브라우저에서 위 주소로 접속하세요.");
+  Serial.println("처음에는 /capture 를 눌러야 사진이 생성됩니다.");
 }
 
 void loop() {
-    switch (currentState) {
-        case STATE_IDLE: {
-            if (isButtonPressed()) {
-                enterState(STATE_BLE_WAIT);
-                return;
-            }
-
-            if (millis() - g_idleEnteredAt >= IDLE_TO_SLEEP_MS) {
-                enterState(STATE_SLEEP);
-                return;
-            }
-
-            delay(10);
-            break;
-        }
-
-        case STATE_BLE_WAIT: {
-            delay(BLE_WAIT_MS);
-            enterState(STATE_FIRST_SCAN);
-            break;
-        }
-
-        case STATE_FIRST_SCAN: {
-            startIR();
-            delay(IR_STABLE_MS);
-
-            captureImage();
-            g_imageScore = analyzeData();
-
-            stopIR();
-
-            Serial.printf("[SCAN1] imageScore = %.3f\n", g_imageScore);
-
-            if (g_imageScore < IMAGE_SCORE_SKIP_THERMAL) {
-                g_thermalScore = 0.0f;
-                g_finalScore = g_imageScore;
-
-                applyResultLeds(g_finalScore);
-                sendCurrentStatus(g_finalScore);
-
-                enterState(STATE_RESULT);
-            } else {
-                enterState(STATE_SECOND_SCAN);
-            }
-
-            break;
-        }
-
-        case STATE_SECOND_SCAN: {
-            g_thermalScore = analyzeDataPrecision();
-            g_finalScore = (g_imageScore * 0.65f) + (g_thermalScore * 0.35f);
-
-            if (g_finalScore < 0.0f) g_finalScore = 0.0f;
-            if (g_finalScore > 1.0f) g_finalScore = 1.0f;
-
-            Serial.printf("[SCAN2] thermalScore = %.3f\n", g_thermalScore);
-            Serial.printf("[FUSE ] finalScore   = %.3f\n", g_finalScore);
-
-            applyResultLeds(g_finalScore);
-            sendCurrentStatus(g_finalScore);
-
-            enterState(STATE_RESULT);
-            break;
-        }
-
-        case STATE_RESULT: {
-            if (g_suspicious) {
-                blinkDanger(2, 140);
-                applyResultLeds(g_finalScore);
-            }
-
-            if (millis() - g_resultEnteredAt >= RESULT_SHOW_MS) {
-                enterState(STATE_SLEEP);
-            } else {
-                delay(20);
-            }
-            break;
-        }
-
-        case STATE_SLEEP: {
-            goDeepSleep();
-            break;
-        }
-
-        case STATE_BOOT:
-        default:
-            enterState(STATE_IDLE);
-            break;
-    }
+  server.handleClient();
 }
